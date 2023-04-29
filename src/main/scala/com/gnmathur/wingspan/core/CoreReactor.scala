@@ -1,26 +1,53 @@
+/*
+MIT License
+
+Copyright (c) 2023 Gaurav Mathur
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+*/
+
 package com.gnmathur.wingspan.core
 
-import com.gnmathur.wingspan.core.{NEXT_OP_T, READ_DONE, READ_DONE_WRITE_NEXT, READ_ERROR, READ_MORE, WRITE_DONE, WRITE_DONE_READ_NEXT, WRITE_ERROR, WRITE_MORE}
 import org.slf4j.LoggerFactory
 
 import java.io.IOException
-import java.net.{InetAddress, InetSocketAddress, SocketAddress}
-import java.nio.ByteBuffer
+import java.net.{InetSocketAddress}
+import java.nio.channels.SelectionKey.{OP_READ, OP_WRITE}
 import java.nio.channels.{SelectionKey, Selector, SocketChannel}
 import java.util
-import java.util.logging.Logger
 import scala.collection.mutable
 
 private case class ClientConnectionContext(clientMetadata: AnyRef, host: String, port: Int)
 
+case class ReactorConnectionContext(ctx: AnyRef)
+
 trait ClientHandlers {
+
   /**
    * Client callback for when a connection is successfully established
    * @param sc The Socket channel associated with the connection
+   * @param connectionContext Opaque state supplied by the reactor. Its supposed to be returned back to the reactor
+   *                          in specific reactor APIs
    * @param clientMetadata Opaque data supplied by the client. It typically encapsulates the client state. Client
    *                       can use this when this callback is invoked to take stateful action
    */
-  def connectDoneCb(sc: SocketChannel, clientMetadata: AnyRef): Unit
+  def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
 
   /**
    * Client callback for when a connection fails to establish
@@ -39,12 +66,12 @@ trait ClientHandlers {
    * can use this when this callback is invoked to take stateful action
    * @return The client instructs what's the next socket operation to set on the selector via type NEXT_OP_T
    */
-  def readCb(sc: SocketChannel, clientMetadata: AnyRef): NEXT_OP_T
-  def readDoneCb(sc: SocketChannel, clientMetadata: AnyRef): Unit
-  def readFailCb(cc: SocketChannel, clientMetadata: AnyRef): Unit
-  def writeCb(sc: SocketChannel, clientMetadata: AnyRef): NEXT_OP_T
-  def writeDoneCb(sc: SocketChannel): Unit
-  def writeFailCb(sc: SocketChannel, clientMetadata: AnyRef): Unit
+  def readCb(sc: SocketChannel, clientMetadata: AnyRef): EVENT_CB_STATUS_T
+  def readDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
+  def readFailCb(cc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
+  def writeCb(sc: SocketChannel, clientMetadata: AnyRef): EVENT_CB_STATUS_T
+  def writeDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext): Unit
+  def writeFailCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
 }
 
 case class TimerCb(
@@ -100,24 +127,11 @@ class CoreReactor {
 
     val r = clientHandlers.get.readCb(clientSocket, clientConnectionContext.clientMetadata)
     r match {
-      case READ_MORE =>
+      case READ_OK =>
         require(clientSocket.isConnected)
-        logger.debug(s"reading more for ${clientSocket.getRemoteAddress}")
-        key.interestOps(SelectionKey.OP_READ)
-      case READ_DONE =>
-        logger.debug(s"read done for ${clientSocket.getRemoteAddress}")
-        clientHandlers.get.readDoneCb(clientSocket, clientConnectionContext.clientMetadata)
-        key.interestOps(key.interestOps & (~SelectionKey.OP_READ))
-      case READ_DONE_WRITE_NEXT =>
-        logger.debug(s"read done write next for ${clientSocket.getRemoteAddress}")
-        require(clientSocket.isConnected)
-        clientHandlers.get.readDoneCb(clientSocket, clientConnectionContext.clientMetadata)
-        key.interestOps(key.interestOps & (~SelectionKey.OP_READ))
-        key.interestOps(SelectionKey.OP_WRITE)
+        clientHandlers.get.readDoneCb(clientSocket, ReactorConnectionContext(key), clientConnectionContext.clientMetadata)
       case READ_ERROR =>
-        logger.debug(s"read error for ${clientSocket.getRemoteAddress}")
-        key.interestOps(key.interestOps & (~SelectionKey.OP_READ))
-        clientHandlers.get.readFailCb(clientSocket, clientConnectionContext.clientMetadata)
+        clientHandlers.get.readFailCb(clientSocket, ReactorConnectionContext(key), clientConnectionContext.clientMetadata)
     }
   }
 
@@ -126,18 +140,18 @@ class CoreReactor {
 
     val r = clientHandlers.get.writeCb(clientSocket, clientConnectionContext.clientMetadata)
 
-    key.interestOps(key.interestOps & (~SelectionKey.OP_WRITE))
+    key.interestOps(key.interestOps & (~OP_WRITE))
     r match {
       case WRITE_DONE_READ_NEXT =>
         require(clientSocket.isConnected)
-        key.interestOps(SelectionKey.OP_READ)
       case WRITE_DONE =>
-        clientHandlers.get.readDoneCb(clientSocket, clientConnectionContext.clientMetadata)
+        require(clientSocket.isConnected)
+        clientHandlers.get.writeDoneCb(clientSocket, ReactorConnectionContext(key))
       case WRITE_MORE =>
         require(clientSocket.isConnected)
-        key.interestOps(SelectionKey.OP_WRITE)
+        key.interestOps(OP_WRITE)
       case WRITE_ERROR =>
-        clientHandlers.get.writeFailCb(clientSocket, clientConnectionContext.clientMetadata)
+        clientHandlers.get.writeFailCb(clientSocket, ReactorConnectionContext(key), clientConnectionContext.clientMetadata)
     }
   }
 
@@ -149,12 +163,63 @@ class CoreReactor {
       val isConnected = client.finishConnect()
       logger.info("Connected: " + isConnected)
       key.interestOps(key.interestOps & (~SelectionKey.OP_CONNECT))
-      key.interestOps(SelectionKey.OP_WRITE)
+      clientHandlers.get.connectDoneCb(client, ReactorConnectionContext(key), ccCtx.clientMetadata)
     } catch {
       case e: IOException =>
         clientHandlers.get.connectFailCb(client, ccCtx.clientMetadata)
       case _ => logger.error("Non I/O exception")
     }
+  }
+
+  /**
+   * Tell the reactor that the connection is ready for writing.
+   *
+   * @param rRef An opaque reference to the client, that was passed to the write callback
+   * @return
+   */
+  def setWriteReady(rRef: ReactorConnectionContext): Unit = {
+    val key = rRef.ctx.asInstanceOf[SelectionKey]
+    key.interestOps(OP_WRITE)
+  }
+
+  /**
+   * Tell the reactor that the connection is ready for reading.
+   * @param rRef An opaque reference to the client, that was passed to the read callback
+   */
+  def setReadReady(rRef: ReactorConnectionContext): Unit = {
+    val key = rRef.ctx.asInstanceOf[SelectionKey]
+    key.interestOps(OP_READ)
+  }
+
+  def clearAll(rRef: ReactorConnectionContext): Unit = {
+    val key = rRef.ctx.asInstanceOf[SelectionKey]
+    key.interestOps(~key.interestOps())
+  }
+
+  /**
+   *  Tell the reactor that the connection is no longer interested in reading. This is necessary to do it explicitly in
+   *  case of an invocation of the read callback that does not read anything from the socket. Otherwise, the reactor will
+   *  keep on invoking the read callback.
+   *
+   * @param rRef A reference to the connection context that was passed to the read callback
+   * @return None
+   */
+  def clearRead(rRef: ReactorConnectionContext): Unit = {
+    val key = rRef.ctx.asInstanceOf[SelectionKey]
+    key.interestOps(key.interestOps() & ~(SelectionKey.OP_READ))
+  }
+
+  /**
+   *  Tell the reactor that the connection is no longer interested in writing. This is necessary to do it explicitly in
+   *  case of an invocation of the write callback that does not write anything to the socket. Otherwise, the reactor will
+   *  keep on invoking the write callback.
+   *
+   * @param rRef A reference to the connection context that was passed to the write callback
+   * @return None
+   */
+  def clearWrite(rRef: ReactorConnectionContext): AnyRef = {
+    val key = rRef.ctx.asInstanceOf[SelectionKey]
+    key.interestOps(key.interestOps() & ~(SelectionKey.OP_WRITE))
   }
 
   def run(): Unit = {

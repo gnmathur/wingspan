@@ -1,7 +1,6 @@
 package com.gnmathur.wingspan.refapplications
 
-import com.gnmathur.wingspan.core.{NEXT_OP_T, READ_DONE_WRITE_NEXT, READ_ERROR, READ_MORE, TcpClient, WRITE_DONE_READ_NEXT}
-import com.gnmathur.wingspan.core.{ClientHandlers, CoreReactor, TimerCb}
+import com.gnmathur.wingspan.core.{ClientHandlers, CoreReactor, EVENT_CB_STATUS_T, READ_ERROR, READ_OK, ReactorConnectionContext, TcpClient, TimerCb, WRITE_DONE}
 import org.slf4j.LoggerFactory
 
 import java.io.IOException
@@ -27,8 +26,9 @@ private sealed case class ConnectionContext( host: String, port: Int, msg: Strin
 class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHandlers {
   private val logger = LoggerFactory.getLogger(classOf[FramedEchoClient])
 
-  override def connectDoneCb(sc: SocketChannel, clientMetadata: AnyRef): Unit = {
+  override def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
     logger.info(s"connected to ${coreReactor.getConnectionRemoteHostAddress(sc)}")
+    coreReactor.setWriteReady(connectionContext)
   }
 
   override def connectFailCb(sc: SocketChannel, clientMetadata: AnyRef): Unit = {
@@ -41,7 +41,7 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
     }))
   }
 
-  override def readCb(sc: SocketChannel, clientMetadata: AnyRef): NEXT_OP_T = {
+  override def readCb(sc: SocketChannel, clientMetadata: AnyRef): EVENT_CB_STATUS_T = {
     val ctx: ConnectionContext = clientMetadata.asInstanceOf[ConnectionContext]
     ctx.readState match {
       case READ_NEW =>
@@ -59,7 +59,7 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
             val messageLength = EchoFrame.getFrameLength(lengthBytes)
             ctx.readBuffer = ByteBuffer.allocate(messageLength)
             ctx.readState = READ_LEN
-            READ_MORE
+            READ_OK
           }
         } catch {
           case e: IOException =>
@@ -78,7 +78,7 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
           READ_ERROR
         } else if (bb.position() != bb.limit()) {
           logger.trace("reading more")
-          READ_MORE
+          READ_OK
         } else {
           bb.flip()
           val bytesRead = new Array[Byte](bb.limit())
@@ -87,16 +87,22 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
           ctx.writeBuffer = ByteBuffer.allocate(1024)
           ctx.readState = READ_NEW
           ctx.readBytes = Some(bytesRead)
-          READ_DONE_WRITE_NEXT
+
+          READ_OK
         }
     }
   }
 
-  override def readDoneCb(sc: SocketChannel, clientMetadata: AnyRef): Unit = {
+  override def readDoneCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
     val cm = clientMetadata.asInstanceOf[ConnectionContext]
-    logger.debug("read done")
-    logger.info("read: " + new String(cm.readBytes.get))
-    //logger.info("read: " + cm.readBytes.get.length)
+    cm.readState match {
+      case READ_NEW =>
+        logger.info("read done")
+        logger.info("read: " + new String(cm.readBytes.get))
+        coreReactor.setWriteReady(reactorConnectionContext)
+      case READ_LEN =>
+        coreReactor.setReadReady(reactorConnectionContext)
+    }
   }
 
   private def reconnect(myContext: ConnectionContext)(): Unit = {
@@ -104,12 +110,13 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
     coreReactor.connect(myContext.host, myContext.port, myContext)
   }
 
-  override def readFailCb(cc: SocketChannel, clientMetadata: AnyRef): Unit = {
+  override def readFailCb(cc: SocketChannel, reactorConnectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
+    coreReactor.clearRead(reactorConnectionContext)
     logger.error("read failed")
     coreReactor.registerTimer(new TimerCb(10000, reconnect(clientMetadata.asInstanceOf[ConnectionContext])))
   }
 
-  override def writeCb(sc: SocketChannel, clientMetadata: AnyRef): NEXT_OP_T = {
+  override def writeCb(sc: SocketChannel, clientMetadata: AnyRef): EVENT_CB_STATUS_T = {
     val cm = clientMetadata.asInstanceOf[ConnectionContext]
     val writeBytes = EchoFrame.frameThis(cm.msg.getBytes)
 
@@ -131,12 +138,15 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
 
     cm.readBuffer = ByteBuffer.allocate(4)
 
-    WRITE_DONE_READ_NEXT
+    WRITE_DONE
   }
 
-  override def writeDoneCb(sc: SocketChannel): Unit = logger.debug("write done")
+  override def writeDoneCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionContext): Unit = {
+    logger.debug("write done")
+    coreReactor.setReadReady(reactorConnectionContext)
+  }
 
-  override def writeFailCb(sc: SocketChannel, clientMetadata: AnyRef): Unit = logger.error("write failed")
+  override def writeFailCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = logger.error("write failed")
 
   coreReactor.registerClient(this)
 
@@ -147,9 +157,10 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
   // coreReactor.connect("sys76-1", 6770, ConnectionContext("sys76-1", 6770, "Taj Mahal is a wonder of the world!"))
   // coreReactor.connect("sys76-1", 6771, ConnectionContext("sys76-1", 6771, "West is west of east"))
   // coreReactor.connect("sys76-1", 6772, ConnectionContext("sys76-1", 6772, "Washington DC is the capital of the US"))
-  (0 until 299) foreach { x =>
-    coreReactor.connect("sys76-1", 10000+x, ConnectionContext("sys76-1", 10000+x, s"We go ${10000+x} steps in the right direction"))
-  }
+  coreReactor.connect("sys76-1", 6773, ConnectionContext("sys76-1", 6773, lines))
+  //(0 until 299) foreach { x =>
+    //coreReactor.connect("sys76-1", 10000+x, ConnectionContext("sys76-1", 10000+x, s"We go ${10000+x} steps in the right direction"))
+  //}
 }
 
 object FramedEchoClient extends App {
