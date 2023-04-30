@@ -9,4 +9,12 @@ lazy val root = (project in file("."))
 
 libraryDependencies ++= Seq(
   "org.slf4j" % "slf4j-api" % "1.7.36",
-  "org.slf4j" % "slf4j-simple" % "1.7.36")
+  "org.slf4j" % "slf4j-simple" % "1.7.36",
+
+  "io.prometheus" % "simpleclient" % "0.16.0",
+  "io.prometheus" % "simpleclient_hotspot" % "0.16.0",
+  "io.prometheus" % "simpleclient_hotspot" % "0.16.0",
+  "io.prometheus" % "simpleclient_httpserver" % "0.16.0",
+  "io.prometheus" % "simpleclient_pushgateway" % "0.16.0"
+
+)

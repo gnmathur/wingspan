@@ -1,11 +1,11 @@
 package com.gnmathur.wingspan.refapplications
 
-import com.gnmathur.wingspan.core.{ClientHandlers, CoreReactor, EVENT_CB_STATUS_T, READ_ERROR, READ_OK, ReactorConnectionContext, TcpClient, TimerCb, WRITE_DONE}
+import com.gnmathur.wingspan.core.{ClientHandlers, CoreReactor, EVENT_CB_STATUS_T, READ_ERROR, READ_OK, ReactorConnectionContext, Statistics, TcpClient, TimerCb, WRITE_OK}
 import org.slf4j.LoggerFactory
 
 import java.io.IOException
 import java.nio.ByteBuffer
-import java.nio.channels.{SelectionKey, SocketChannel}
+import java.nio.channels.SocketChannel
 
 /**
  * TODOs
@@ -16,6 +16,9 @@ abstract class READ_STATE
 case object READ_NEW extends READ_STATE
 case object READ_LEN extends READ_STATE
 
+/** Tracks application state. Handed to the reactor at creation, and is handed to this application in callbacks to
+ * let the application retrieve its state.
+ */
 private sealed case class ConnectionContext( host: String, port: Int, msg: String) {
   var readState: READ_STATE = READ_NEW
   var readBuffer: ByteBuffer = ByteBuffer.allocate(4)
@@ -24,7 +27,7 @@ private sealed case class ConnectionContext( host: String, port: Int, msg: Strin
 }
 
 class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHandlers {
-  private val logger = LoggerFactory.getLogger(classOf[FramedEchoClient])
+  protected val logger = LoggerFactory.getLogger(classOf[FramedEchoClient])
 
   override def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
     logger.info(s"connected to ${coreReactor.getConnectionRemoteHostAddress(sc)}")
@@ -48,6 +51,9 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
         val bb = ctx.readBuffer
         try {
           val read = sc.read(bb)
+
+          if (read != -1) Statistics.incrementReadRequests(read, sc.getRemoteAddress.toString)
+
           logger.trace(s"read $read bytes")
 
           if (read == -1) {
@@ -71,6 +77,8 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
       case READ_LEN =>
         val bb = ctx.readBuffer
         val read = sc.read(bb)
+
+        if (read != -1) Statistics.incrementReadRequests(read, sc.getRemoteAddress.toString)
         logger.trace(s"read $read bytes")
 
         if (read == -1) {
@@ -136,9 +144,10 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
     }
     bb.clear()
 
+    Statistics.incrementWriteRequests(writeBytes.length, sc.getRemoteAddress.toString)
     cm.readBuffer = ByteBuffer.allocate(4)
 
-    WRITE_DONE
+    WRITE_OK
   }
 
   override def writeDoneCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionContext): Unit = {
@@ -146,18 +155,19 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
     coreReactor.setReadReady(reactorConnectionContext)
   }
 
-  override def writeFailCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = logger.error("write failed")
+  override def writeFailCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
+    logger.error("write failed")
+    coreReactor.clearWrite(reactorConnectionContext)
+  }
 
   coreReactor.registerClient(this)
-
   //
   private val source = scala.io.Source.fromResource("odyssey.txt")
   private val lines = try source.mkString finally source.close()
-
-  // coreReactor.connect("sys76-1", 6770, ConnectionContext("sys76-1", 6770, "Taj Mahal is a wonder of the world!"))
-  // coreReactor.connect("sys76-1", 6771, ConnectionContext("sys76-1", 6771, "West is west of east"))
-  // coreReactor.connect("sys76-1", 6772, ConnectionContext("sys76-1", 6772, "Washington DC is the capital of the US"))
-  coreReactor.connect("sys76-1", 6773, ConnectionContext("sys76-1", 6773, lines))
+  coreReactor.connect("sys76-1", 6770, ConnectionContext("sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!"))
+  coreReactor.connect("sys76-1", 6771, ConnectionContext("sys76-1", 6771, "West is west of east. East is east of west. Fact"))
+  coreReactor.connect("sys76-1", 6772, ConnectionContext("sys76-1", 6772, "Washington DC is the capital of the US. ======="))
+  // coreReactor.connect("sys76-1", 6773, ConnectionContext("sys76-1", 6773, lines))
   //(0 until 299) foreach { x =>
     //coreReactor.connect("sys76-1", 10000+x, ConnectionContext("sys76-1", 10000+x, s"We go ${10000+x} steps in the right direction"))
   //}

@@ -24,13 +24,18 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 
 package com.gnmathur.wingspan.core
 
-import org.slf4j.LoggerFactory
+import io.prometheus.client.CollectorRegistry
+import io.prometheus.client.exporter.HTTPServer
+import io.prometheus.client.exporter.HTTPServer.Builder
+import org.slf4j.{Logger, LoggerFactory}
 
 import java.io.IOException
-import java.net.{InetSocketAddress}
+import java.net.InetSocketAddress
 import java.nio.channels.SelectionKey.{OP_READ, OP_WRITE}
 import java.nio.channels.{SelectionKey, Selector, SocketChannel}
 import java.util
+import java.util.concurrent.{Semaphore, TimeUnit}
+import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
 
 private case class ClientConnectionContext(clientMetadata: AnyRef, host: String, port: Int)
@@ -67,8 +72,31 @@ trait ClientHandlers {
    * @return The client instructs what's the next socket operation to set on the selector via type NEXT_OP_T
    */
   def readCb(sc: SocketChannel, clientMetadata: AnyRef): EVENT_CB_STATUS_T
+
+  /**
+   * Read callback for when there's nothing more to be read from the a connection channel
+   *
+   * @param sc Socket channel associated with the client connection
+   * @param connectionContext Opaque state supplied by the reactor. Its supposed to be returned back to the reactor in some APIs
+   * @param clientMetadata Opaque data supplied by the client. It typically encapsulates the client state.
+   */
   def readDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
+
+  /**
+   * Read callback for when there's an error reading from the a connection channel
+   *
+   * @param cc Socket channel associated with the client connection
+   * @param connectionContext Opaque state supplied by the reactor. Its supposed to be returned back to the reactor in some APIs
+   * @param clientMetadata Opaque data supplied by the client. It typically encapsulates the client state.
+   */
   def readFailCb(cc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
+
+  /**
+   * Write callback for when there's something to be written to the a connection channel
+   * @param sc Socket channel associated with the client connection
+   * @param clientMetadata Opaque data supplied by the client. It typically encapsulates the client state.
+   * @return The client instructs what's the next socket operation to set on the selector via type NEXT_OP_T
+   */
   def writeCb(sc: SocketChannel, clientMetadata: AnyRef): EVENT_CB_STATUS_T
   def writeDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext): Unit
   def writeFailCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
@@ -87,6 +115,38 @@ class CoreReactor {
   private val timers = new mutable.PriorityQueue[TimerCb]()(Ordering.by(orderTimers).reverse)
   private val logger = LoggerFactory.getLogger(classOf[CoreReactor])
   private var clientHandlers: Option[ClientHandlers] = None
+  private val keepRunning: AtomicBoolean = new AtomicBoolean(true)
+  private val haltSignal = new Semaphore(0)
+  private val registry = new CollectorRegistry()
+  private val httpServer = new HTTPServer.Builder().withPort(8080).withPort(8081).build()
+  private val SHUTDOWN_TIMER_EXPIRY_MS = 60000
+  private val thisThread = Thread.currentThread()
+
+  Runtime.getRuntime.addShutdownHook(new Thread() {
+    override def run(): Unit = {
+      logger.info("Shutting down reactor")
+      keepRunning.set(false)
+
+      if (haltSignal.tryAcquire(SHUTDOWN_TIMER_EXPIRY_MS, TimeUnit.MILLISECONDS)) {
+        logger.info("Reactor shut down gracefully")
+      } else {
+        logger.error("Timed out waiting for reactor to shut down. Will interrupt the thread")
+        thisThread.interrupt()
+        if (haltSignal.tryAcquire(60, TimeUnit.MILLISECONDS)) {
+          logger.info("Reactor shut down gracefully (after interrupt)")
+        } else {
+          logger.error("Timed out waiting for reactor to shut down. Will exit")
+        }
+      }
+    }
+  })
+
+  private def stopReactor(): Unit = {
+    logger.info("Closing metrics server")
+    httpServer.close()
+    logger.info("Closing selector")
+    selector.close()
+  }
 
   def closeConnection(cc: SocketChannel) = {
     val selectionKey = cc.keyFor(selector)
@@ -140,16 +200,10 @@ class CoreReactor {
 
     val r = clientHandlers.get.writeCb(clientSocket, clientConnectionContext.clientMetadata)
 
-    key.interestOps(key.interestOps & (~OP_WRITE))
     r match {
-      case WRITE_DONE_READ_NEXT =>
-        require(clientSocket.isConnected)
-      case WRITE_DONE =>
+      case WRITE_OK =>
         require(clientSocket.isConnected)
         clientHandlers.get.writeDoneCb(clientSocket, ReactorConnectionContext(key))
-      case WRITE_MORE =>
-        require(clientSocket.isConnected)
-        key.interestOps(OP_WRITE)
       case WRITE_ERROR =>
         clientHandlers.get.writeFailCb(clientSocket, ReactorConnectionContext(key), clientConnectionContext.clientMetadata)
     }
@@ -167,7 +221,7 @@ class CoreReactor {
     } catch {
       case e: IOException =>
         clientHandlers.get.connectFailCb(client, ccCtx.clientMetadata)
-      case _ => logger.error("Non I/O exception")
+      case _: Throwable => logger.error("Non I/O exception")
     }
   }
 
@@ -223,8 +277,8 @@ class CoreReactor {
   }
 
   def run(): Unit = {
-    while (true) {
-      val readyN = selector.select(if (timers.isEmpty) 100 else timers.head.timeout)
+    while (keepRunning.get()) {
+      val readyN = selector.select(if (timers.isEmpty) SHUTDOWN_TIMER_EXPIRY_MS/2 else timers.head.timeout)
 
       while (timers.nonEmpty && (timers.head.createdAt + timers.head.timeout) < System.currentTimeMillis()) {
         val timerCb = timers.dequeue()
@@ -247,5 +301,8 @@ class CoreReactor {
       }
       selectedKeys.clear()
     }
+
+    stopReactor()
+    haltSignal.release()
   }
 }
