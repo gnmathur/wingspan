@@ -12,21 +12,29 @@ import java.nio.channels.SocketChannel
  * 1. Does this need to be a class at all? These are all static objects
  */
 
-abstract class READ_STATE
-case object READ_NEW extends READ_STATE
-case object READ_LEN extends READ_STATE
+object PeriodicEchoClient extends App {
+  private abstract class READ_STATE
+  private case object READ_NEW extends READ_STATE
+  private case object READ_LEN extends READ_STATE
 
-/** Tracks application state. Handed to the reactor at creation, and is handed to this application in callbacks to
- * let the application retrieve its state.
- */
-private sealed case class ConnectionContext( host: String, port: Int, msg: String) {
-  var readState: READ_STATE = READ_NEW
-  var readBuffer: ByteBuffer = ByteBuffer.allocate(4)
-  var writeBuffer: ByteBuffer = ByteBuffer.allocate(1024)
-  var readBytes: Option[Array[Byte]] = None
+  /** Tracks application state. Handed to the reactor at creation, and is handed to this application in callbacks to
+   * let the application retrieve its state.
+   */
+  private sealed case class ConnectionContext(host: String, port: Int, msg: String) {
+    var readState: READ_STATE = READ_NEW
+    var readBuffer: ByteBuffer = ByteBuffer.allocate(4)
+    var writeBuffer: ByteBuffer = ByteBuffer.allocate(1024)
+    var readBytes: Option[Array[Byte]] = None
+  }
+
+  private val coreReactor: CoreReactor = new CoreReactor()
+  new MultiEchoClient(coreReactor)
+  coreReactor.run()
 }
 
-class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHandlers {
+class MultiEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHandlers {
+  import PeriodicEchoClient._
+
   protected val logger = LoggerFactory.getLogger(classOf[MultiEchoClient])
 
   override def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
@@ -105,9 +113,8 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
     val cm = clientMetadata.asInstanceOf[ConnectionContext]
     cm.readState match {
       case READ_NEW =>
-        logger.info("read done")
         logger.info("read: " + new String(cm.readBytes.get))
-        coreReactor.setWriteReady(reactorConnectionContext)
+
       case READ_LEN =>
         coreReactor.setReadReady(reactorConnectionContext)
     }
@@ -121,7 +128,6 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
   override def readFailCb(cc: SocketChannel, reactorConnectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
     coreReactor.clearRead(reactorConnectionContext)
     logger.error("read failed")
-    coreReactor.registerTimer(new TimerCb(10000, false, reconnect(clientMetadata.asInstanceOf[ConnectionContext])))
   }
 
   override def writeCb(sc: SocketChannel, clientMetadata: AnyRef): EVENT_CB_STATUS_T = {
@@ -160,21 +166,18 @@ class FramedEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHa
     coreReactor.clearWrite(reactorConnectionContext)
   }
 
-  coreReactor.registerClient(this)
-  //
-  private val source = scala.io.Source.fromResource("odyssey.txt")
-  private val lines = try source.mkString finally source.close()
-  coreReactor.registerRequest("sys76-1", 6770, ConnectionContext("sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!"))
-  //coreReactor.connect("sys76-1", 6771, ConnectionContext("sys76-1", 6771, "West is west of east. East is east of west. Fact"))
-  // coreReactor.connect("sys76-1", 6772, ConnectionContext("sys76-1", 6772, "Washington DC is the capital of the US. ======="))
-  // coreReactor.connect("sys76-1", 6773, ConnectionContext("sys76-1", 6773, lines))
-  //(0 until 299) foreach { x =>
-    //coreReactor.connect("sys76-1", 10000+x, ConnectionContext("sys76-1", 10000+x, s"We go ${10000+x} steps in the right direction"))
-  //}
-}
+  private def runClient(periodInMs: Int, host: String, port: Int, msg: String) {
+    val randomJitter = scala.util.Random.nextInt(1000)
+    val addOrSub = if (scala.util.Random.nextInt(100) < 50) -1 else 1
 
-object FramedEchoClient extends App {
-  private val coreReactor: CoreReactor = new CoreReactor()
-  new MultiEchoClient(coreReactor)
-  coreReactor.run()
+    coreReactor.registerTimer(TimerCb(periodInMs+ (addOrSub * randomJitter), true, () => {
+      coreReactor.registerRequest(host, port, ConnectionContext(host, port, msg))
+    }))
+  }
+
+  coreReactor.registerClient( this)
+  runClient(10000, "sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!")
+  runClient(10000, "sys76-1", 6771, "West is west of east. East is east of west. Fact")
+  runClient(5000, "sys76-1", 6772, "Washington DC is the capital of the US. =======")
+  runClient(15000, "sys76-1", 6773, "Two roads diverged in a wood, and I – I took the road less traveled by")
 }
