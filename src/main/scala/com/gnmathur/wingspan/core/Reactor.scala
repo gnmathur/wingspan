@@ -52,11 +52,15 @@ private case class ClientConnectionStats() {
   var lastRespRcvdAt: Option[Long] = None
 }
 
-private case class ReactorClientConnCtx(clientMetadata: AnyRef, host: String, port: Int) {
+// Container for client's connection-specific context, including the client's metadata, which is opaque to the
+// reactor
+private case class ReactorClientConnCtx(clientMetadata: AnyRef, host: String, port: Int, periodInMs: Long) {
   val stats = ClientConnectionStats()
 }
 
-case class ReactorConnectionContext(ctx: AnyRef)
+// Connection context understood by the reactor but opaque to the client. The client is supposed to return this back
+// in specific reactor APIs
+case class ReactorConnectionCtx(ctx: AnyRef)
 
 trait ClientHandlers {
 
@@ -68,7 +72,7 @@ trait ClientHandlers {
    * @param clientMetadata Opaque data supplied by the client. It typically encapsulates the client state. Client
    *                       can use this when this callback is invoked to take stateful action
    */
-  def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
+  def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit
 
   /**
    * Client callback for when a connection fails to establish
@@ -96,7 +100,7 @@ trait ClientHandlers {
    * @param connectionContext Opaque state supplied by the reactor. Its supposed to be returned back to the reactor in some APIs
    * @param clientMetadata Opaque data supplied by the client. It typically encapsulates the client state.
    */
-  def readDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
+  def readDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit
 
   /**
    * Read callback for when there's an error reading from the a connection channel
@@ -105,7 +109,7 @@ trait ClientHandlers {
    * @param connectionContext Opaque state supplied by the reactor. Its supposed to be returned back to the reactor in some APIs
    * @param clientMetadata Opaque data supplied by the client. It typically encapsulates the client state.
    */
-  def readFailCb(cc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
+  def readFailCb(cc: SocketChannel, connectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit
 
   /**
    * Write callback for when there's something to be written to the a connection channel
@@ -114,8 +118,8 @@ trait ClientHandlers {
    * @return The client instructs what's the next socket operation to set on the selector via type NEXT_OP_T
    */
   def writeCb(sc: SocketChannel, clientMetadata: AnyRef): EVENT_CB_STATUS_T
-  def writeDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext): Unit
-  def writeFailCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit
+  def writeDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionCtx): Unit
+  def writeFailCb(sc: SocketChannel, connectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit
 }
 
 object TimerIdGiver {
@@ -135,13 +139,16 @@ class TimerCb(val timeout: Long,  // in milliseconds
   def isExpired: Boolean = expiresAt < System.currentTimeMillis()
   def call(): Unit = timerCb
   val id: Int = TimerIdGiver.give
+
+
+  override def toString = s"TimerCb($createdAt, $expiresAt, $id, $timeout, $isExpired)"
 }
 
-class CoreReactor {
+class Reactor {
   private val selector: Selector = Selector.open()
   private def orderTimers(timerCb: TimerCb) = timerCb.expiresAt
   private val timers = new mutable.PriorityQueue[TimerCb]()(Ordering.by(orderTimers).reverse)
-  private val logger = LoggerFactory.getLogger(classOf[CoreReactor])
+  private val logger = LoggerFactory.getLogger(classOf[Reactor])
   private var clientHandlers: Option[ClientHandlers] = None
   private val clientConnectionList = mutable.LinkedHashMap[(String, Int), ReactorClientConnCtx]()
   private val keepRunning: AtomicBoolean = new AtomicBoolean(true)
@@ -200,19 +207,23 @@ class CoreReactor {
     clientHandlers = Some(ch)
   }
 
-  private def connectAndReschedule(periodInMs: Long, host: String, port: Int, reactorClientConnCtx: ReactorClientConnCtx): Unit = {
+  private def connect(reactorClientConnCtx: ReactorClientConnCtx): Unit = {
     val client: SocketChannel = SocketChannel.open();
+    client.configureBlocking(false)
     val selectionKey: SelectionKey = client.register(selector, SelectionKey.OP_CONNECT);
 
     selectionKey.attach(reactorClientConnCtx)
-    client.configureBlocking(false)
-    client.connect(new InetSocketAddress(host, port))
+    client.connect(new InetSocketAddress(reactorClientConnCtx.host, reactorClientConnCtx.port))
     reactorClientConnCtx.stats.connectAttempts = reactorClientConnCtx.stats.connectAttempts + 1
 
+    scheduleConnect(reactorClientConnCtx)
+  }
+
+  private def scheduleConnect(reactorClientConnCtx: ReactorClientConnCtx) = {
     val randomJitter = scala.util.Random.nextInt(1000)
     val addOrSub = if (scala.util.Random.nextInt(100) < 50) -1 else 1
 
-    registerTimer(new TimerCb(periodInMs + (addOrSub * randomJitter), connectAndReschedule(periodInMs, host, port, reactorClientConnCtx)))
+    registerTimer(new TimerCb(reactorClientConnCtx.periodInMs + (addOrSub * randomJitter), connect(reactorClientConnCtx)))
   }
 
   /**
@@ -223,10 +234,10 @@ class CoreReactor {
    * @param connectionCtx Opaque connection context to be returned back to client handlers callbacks
    */
   def registerRequest(host: String, port: Int, periodInMs: Long, connectionCtx: AnyRef): Unit = {
-    val reactorClientConnCtx = ReactorClientConnCtx(connectionCtx, host, port)
+    val reactorClientConnCtx = ReactorClientConnCtx(connectionCtx, host, port, periodInMs)
     clientConnectionList += (host, port) -> reactorClientConnCtx
 
-    connectAndReschedule(periodInMs, host, port, reactorClientConnCtx)
+    scheduleConnect(reactorClientConnCtx)
   }
 
   /**
@@ -243,11 +254,12 @@ class CoreReactor {
         require(clientSocket.isConnected)
         reactorClientConnCtx.stats.reads = reactorClientConnCtx.stats.reads + 1
         reactorClientConnCtx.stats.lastRespRcvdAt = Some(System.currentTimeMillis())
-        clientHandlers.get.readDoneCb(clientSocket, ReactorConnectionContext(key), reactorClientConnCtx.clientMetadata)
+        clientHandlers.get.readDoneCb(clientSocket, ReactorConnectionCtx(key), reactorClientConnCtx.clientMetadata)
 
       case READ_ERROR =>
         reactorClientConnCtx.stats.readFails = reactorClientConnCtx.stats.readFails + 1
-        clientHandlers.get.readFailCb(clientSocket, ReactorConnectionContext(key), reactorClientConnCtx.clientMetadata)
+        clientHandlers.get.readFailCb(clientSocket, ReactorConnectionCtx(key), reactorClientConnCtx.clientMetadata)
+        done(ReactorConnectionCtx(key))
     }
   }
 
@@ -261,10 +273,10 @@ class CoreReactor {
         require(clientSocket.isConnected)
         reactorClientConnCtx.stats.writes = reactorClientConnCtx.stats.writes + 1
         reactorClientConnCtx.stats.lastReqSentAt = Some(System.currentTimeMillis())
-        clientHandlers.get.writeDoneCb(clientSocket, ReactorConnectionContext(key))
+        clientHandlers.get.writeDoneCb(clientSocket, ReactorConnectionCtx(key))
       case WRITE_ERROR =>
         reactorClientConnCtx.stats.writeFails = reactorClientConnCtx.stats.writeFails + 1
-        clientHandlers.get.writeFailCb(clientSocket, ReactorConnectionContext(key), reactorClientConnCtx.clientMetadata)
+        clientHandlers.get.writeFailCb(clientSocket, ReactorConnectionCtx(key), reactorClientConnCtx.clientMetadata)
     }
   }
 
@@ -277,11 +289,13 @@ class CoreReactor {
       logger.info("Connected: " + isConnected)
       reactorClientConnCtx.stats.connectSuccess = reactorClientConnCtx.stats.connectSuccess + 1
       key.interestOps(key.interestOps & (~SelectionKey.OP_CONNECT))
-      clientHandlers.get.connectDoneCb(client, ReactorConnectionContext(key), reactorClientConnCtx.clientMetadata)
+      clientHandlers.get.connectDoneCb(client, ReactorConnectionCtx(key), reactorClientConnCtx.clientMetadata)
     } catch {
       case e: IOException =>
         clientHandlers.get.connectFailCb(client, reactorClientConnCtx.clientMetadata)
         reactorClientConnCtx.stats.connectFails = reactorClientConnCtx.stats.connectFails + 1
+        done(ReactorConnectionCtx(key))
+
       case _: Throwable => logger.error("Non I/O exception")
     }
   }
@@ -292,7 +306,7 @@ class CoreReactor {
    * @param rRef An opaque reference to the client, that was passed to the write callback
    * @return
    */
-  def setWriteReady(rRef: ReactorConnectionContext): Unit = {
+  def setWriteReady(rRef: ReactorConnectionCtx): Unit = {
     val key = rRef.ctx.asInstanceOf[SelectionKey]
     key.interestOps(OP_WRITE)
   }
@@ -301,12 +315,12 @@ class CoreReactor {
    * Tell the reactor that the connection is ready for reading.
    * @param rRef An opaque reference to the client, that was passed to the read callback
    */
-  def setReadReady(rRef: ReactorConnectionContext): Unit = {
+  def setReadReady(rRef: ReactorConnectionCtx): Unit = {
     val key = rRef.ctx.asInstanceOf[SelectionKey]
     key.interestOps(OP_READ)
   }
 
-  def clearAll(rRef: ReactorConnectionContext): Unit = {
+  def clearAll(rRef: ReactorConnectionCtx): Unit = {
     val key = rRef.ctx.asInstanceOf[SelectionKey]
     key.interestOps(~key.interestOps())
   }
@@ -319,7 +333,7 @@ class CoreReactor {
    * @param rRef A reference to the connection context that was passed to the read callback
    * @return None
    */
-  def clearRead(rRef: ReactorConnectionContext): Unit = {
+  def clearRead(rRef: ReactorConnectionCtx): Unit = {
     val key = rRef.ctx.asInstanceOf[SelectionKey]
     key.interestOps(key.interestOps() & ~(SelectionKey.OP_READ))
   }
@@ -332,14 +346,17 @@ class CoreReactor {
    * @param rRef A reference to the connection context that was passed to the write callback
    * @return None
    */
-  def clearWrite(rRef: ReactorConnectionContext): AnyRef = {
+  def clearWrite(rRef: ReactorConnectionCtx): AnyRef = {
     val key = rRef.ctx.asInstanceOf[SelectionKey]
     key.interestOps(key.interestOps() & ~(SelectionKey.OP_WRITE))
   }
 
-  def done(rRef: ReactorConnectionContext) = {
+  def done(rRef: ReactorConnectionCtx) = {
     val key = rRef.ctx.asInstanceOf[SelectionKey]
-    key.cancel()
+
+    if (key.isValid) {
+      key.cancel()
+    }
     val client: SocketChannel = key.channel().asInstanceOf[SocketChannel]
     closeConnection(client)
   }
@@ -351,24 +368,24 @@ class CoreReactor {
 
       val line =
       s"[host: ${host}, port: ${port}]  " +
-      s"connAttempts: ${c.connectAttempts}, connFails: ${c.connectFails} connSucc: ${c.connectSuccess}" +
-      s"read: ${c.reads} read: ${c.readFails} writes: ${c.writes} writeFails: ${c.writeFails}" +
+      s"connAttempts: ${c.connectAttempts}, connFails: ${c.connectFails} connSucc: ${c.connectSuccess} " +
+      s"read: ${c.reads} read: ${c.readFails} writes: ${c.writes} writeFails: ${c.writeFails} " +
       s"lastReqAt: ${lastResponseRcvdAt} lastRespAt: ${lastResponseRcvdAt}"
 
       logger.info(line)
     }
 
     clientConnectionList.foreach { case ((h, p), rCCCtx) => printConnectionStats(h, p, rCCCtx.stats) }
-    registerTimer(new TimerCb(60000, () => statsPrinter()))
+    registerTimer(new TimerCb(30000, statsPrinter))
   }
 
-  private def smallestTimeout = 1000
+  private def selectTimeout = 500
 
   def run(): Unit = {
-    registerTimer(new TimerCb(60000, () => statsPrinter()))
+    statsPrinter
 
     while (keepRunning.get()) {
-      val readyN = selector.select(if (timers.isEmpty) SHUTDOWN_TIMER_EXPIRY_MS/2 else smallestTimeout)
+      val readyN = selector.select(selectTimeout)
 
       while (timers.nonEmpty && (timers.head.isExpired)) {
         val timerCb = timers.dequeue()

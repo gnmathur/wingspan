@@ -1,6 +1,6 @@
 package com.gnmathur.wingspan.refapplications
 
-import com.gnmathur.wingspan.core.{ClientHandlers, CoreReactor, EVENT_CB_STATUS_T, READ_ERROR, READ_OK, ReactorConnectionContext, Statistics, TcpClient, TimerCb, WRITE_OK}
+import com.gnmathur.wingspan.core.{ClientHandlers, Reactor, EVENT_CB_STATUS_T, READ_ERROR, READ_OK, ReactorConnectionCtx, Statistics, TcpClient, TimerCb, WRITE_OK}
 import org.slf4j.LoggerFactory
 
 import java.io.IOException
@@ -27,17 +27,17 @@ object PeriodicEchoClient extends App {
     var readBytes: Option[Array[Byte]] = None
   }
 
-  private val coreReactor: CoreReactor = new CoreReactor()
-  new MultiEchoClient(coreReactor)
+  private val coreReactor: Reactor = new Reactor()
+  new PeriodicEchoClient(coreReactor)
   coreReactor.run()
 }
 
-class MultiEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHandlers {
+class PeriodicEchoClient(coreReactor: Reactor) extends TcpClient with ClientHandlers {
   import PeriodicEchoClient._
 
-  protected val logger = LoggerFactory.getLogger(classOf[MultiEchoClient])
+  protected val logger = LoggerFactory.getLogger(classOf[PeriodicEchoClient])
 
-  override def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
+  override def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit = {
     logger.info(s"connected to ${coreReactor.getConnectionRemoteHostAddress(sc)}")
     coreReactor.setWriteReady(connectionContext)
   }
@@ -45,11 +45,6 @@ class MultiEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHan
   override def connectFailCb(sc: SocketChannel, clientMetadata: AnyRef): Unit = {
     val cm = clientMetadata.asInstanceOf[ConnectionContext]
     logger.error(s"failed connection to ${cm.host}:${cm.port}")
-    coreReactor.closeConnection(sc)
-
-    coreReactor.registerTimer(new TimerCb(5000, false, () => {
-      coreReactor.registerRequest(cm.host, cm.port, clientMetadata)
-    }))
   }
 
   override def readCb(sc: SocketChannel, clientMetadata: AnyRef): EVENT_CB_STATUS_T = {
@@ -109,11 +104,12 @@ class MultiEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHan
     }
   }
 
-  override def readDoneCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
+  override def readDoneCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit = {
     val cm = clientMetadata.asInstanceOf[ConnectionContext]
     cm.readState match {
       case READ_NEW =>
         logger.info("read: " + new String(cm.readBytes.get))
+        coreReactor.done(reactorConnectionContext)
 
       case READ_LEN =>
         coreReactor.setReadReady(reactorConnectionContext)
@@ -122,10 +118,10 @@ class MultiEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHan
 
   private def reconnect(myContext: ConnectionContext)(): Unit = {
     logger.info("reconnecting " + myContext.host + " " + myContext.port)
-    coreReactor.registerRequest(myContext.host, myContext.port, myContext)
+    //coreReactor.registerRequest(myContext.host, myContext.port, myContext)
   }
 
-  override def readFailCb(cc: SocketChannel, reactorConnectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
+  override def readFailCb(cc: SocketChannel, reactorConnectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit = {
     coreReactor.clearRead(reactorConnectionContext)
     logger.error("read failed")
   }
@@ -156,12 +152,12 @@ class MultiEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHan
     WRITE_OK
   }
 
-  override def writeDoneCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionContext): Unit = {
+  override def writeDoneCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionCtx): Unit = {
     logger.debug("write done")
     coreReactor.setReadReady(reactorConnectionContext)
   }
 
-  override def writeFailCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
+  override def writeFailCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit = {
     logger.error("write failed")
     coreReactor.clearWrite(reactorConnectionContext)
   }
@@ -170,13 +166,11 @@ class MultiEchoClient(coreReactor: CoreReactor) extends TcpClient with ClientHan
     val randomJitter = scala.util.Random.nextInt(1000)
     val addOrSub = if (scala.util.Random.nextInt(100) < 50) -1 else 1
 
-    coreReactor.registerTimer(TimerCb(periodInMs+ (addOrSub * randomJitter), true, () => {
-      coreReactor.registerRequest(host, port, ConnectionContext(host, port, msg))
-    }))
+    coreReactor.registerRequest(host, port, periodInMs, ConnectionContext(host, port, msg))
   }
 
   coreReactor.registerClient( this)
-  runClient(10000, "sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!")
+  runClient(60000, "sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!")
   runClient(10000, "sys76-1", 6771, "West is west of east. East is east of west. Fact")
   runClient(5000, "sys76-1", 6772, "Washington DC is the capital of the US. =======")
   runClient(15000, "sys76-1", 6773, "Two roads diverged in a wood, and I – I took the road less traveled by")

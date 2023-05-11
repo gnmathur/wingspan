@@ -1,11 +1,11 @@
 package com.gnmathur.wingspan.refapplications
 
-import com.gnmathur.wingspan.core.{CoreReactor, ReactorConnectionContext, TimerCb}
+import com.gnmathur.wingspan.core.{Reactor, ReactorConnectionCtx, TimerCb}
 
 import java.nio.channels.SocketChannel
 
-class TimedFramedEchoClient(coreReactor: CoreReactor) extends MultiEchoClient(coreReactor) {
-  override def readDoneCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionContext, clientMetadata: AnyRef): Unit = {
+class TimedFramedEchoClient(coreReactor: Reactor) extends FramedEchoClient(coreReactor) {
+  override def readDoneCb(sc: SocketChannel, reactorConnectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit = {
     val cm = clientMetadata.asInstanceOf[ConnectionContext]
     cm.readState match {
       case READ_NEW =>
@@ -16,9 +16,9 @@ class TimedFramedEchoClient(coreReactor: CoreReactor) extends MultiEchoClient(co
         val randomJitter = scala.util.Random.nextInt(1000)
         val addOrSub = if (scala.util.Random.nextInt(100) < 50) -1 else 1
 
-        coreReactor.registerTimer(TimerCb(5000 + (addOrSub * randomJitter), false, () => {
-          coreReactor.setWriteReady(reactorConnectionContext)
-        }))
+        //coreReactor.registerTimer(TimerCb(5000 + (addOrSub * randomJitter), false, () => {
+        //  coreReactor.setWriteReady(reactorConnectionContext)
+        //}))
       case READ_LEN =>
         coreReactor.setReadReady(reactorConnectionContext)
     }
@@ -26,7 +26,7 @@ class TimedFramedEchoClient(coreReactor: CoreReactor) extends MultiEchoClient(co
 }
 
 object TimedFramedEchoClient extends App {
-  private val coreReactor: CoreReactor = new CoreReactor()
+  private val coreReactor: Reactor = new Reactor()
   new TimedFramedEchoClient(coreReactor)
   coreReactor.run()
 }
