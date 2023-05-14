@@ -33,12 +33,12 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.nio.channels.SelectionKey.{OP_READ, OP_WRITE}
 import java.nio.channels.{SelectionKey, Selector, SocketChannel}
-import java.sql.Timestamp
 import java.util
 import java.util.{Date, UUID}
 import java.util.concurrent.{Semaphore, TimeUnit}
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
+import scala.util.Try
 
 private case class ClientConnectionStats() {
   var connectAttempts = 0L
@@ -184,20 +184,23 @@ class Reactor {
     selector.close()
   }
 
-  def closeConnection(cc: SocketChannel): Unit = {
+  private def closeConnection(cc: SocketChannel): Unit = {
     val selectionKey = cc.keyFor(selector)
-    selectionKey.cancel()
+    if (selectionKey.isValid)
+      selectionKey.cancel()
+    else
+      logger.warn("Selection key is not valid. Ignoring")
     cc.close()
   }
 
-  def getConnectionRemoteHostName(cc: SocketChannel): String = cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getHostName
-  def getConnectionRemoteHostAddress(cc: SocketChannel): String = {
-    if (cc.isConnected)
-      cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getAddress.getHostAddress
-    else
-      "<Unconnected>"
-  }
-  def getConnectionRemotePort(cc: SocketChannel): Int = cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getPort
+  def getConnectionRemoteHostName(cc: SocketChannel): Try[String] =
+      Try(cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getHostName)
+
+  def getConnectionRemoteHostAddress(cc: SocketChannel): Try[String] =
+      Try(cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getAddress.getHostAddress)
+
+  def getConnectionRemotePort(cc: SocketChannel): Try[Int] =
+    Try(cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getPort)
 
   def registerTimer(timerCb: TimerCb): Unit = {
     timers.enqueue(timerCb)
@@ -219,7 +222,7 @@ class Reactor {
     scheduleConnect(reactorClientConnCtx)
   }
 
-  private def scheduleConnect(reactorClientConnCtx: ReactorClientConnCtx) = {
+  private def scheduleConnect(reactorClientConnCtx: ReactorClientConnCtx): Unit = {
     val randomJitter = scala.util.Random.nextInt(1000)
     val addOrSub = if (scala.util.Random.nextInt(100) < 50) -1 else 1
 
@@ -286,7 +289,7 @@ class Reactor {
     val reactorClientConnCtx = key.attachment().asInstanceOf[ReactorClientConnCtx]
     try {
       val isConnected = client.finishConnect()
-      logger.info("Connected: " + isConnected)
+      logger.debug("Connected: " + client.getRemoteAddress)
       reactorClientConnCtx.stats.connectSuccess = reactorClientConnCtx.stats.connectSuccess + 1
       key.interestOps(key.interestOps & (~SelectionKey.OP_CONNECT))
       clientHandlers.get.connectDoneCb(client, ReactorConnectionCtx(key), reactorClientConnCtx.clientMetadata)
@@ -295,7 +298,6 @@ class Reactor {
         clientHandlers.get.connectFailCb(client, reactorClientConnCtx.clientMetadata)
         reactorClientConnCtx.stats.connectFails = reactorClientConnCtx.stats.connectFails + 1
         done(ReactorConnectionCtx(key))
-
       case _: Throwable => logger.error("Non I/O exception")
     }
   }
@@ -353,10 +355,6 @@ class Reactor {
 
   def done(rRef: ReactorConnectionCtx) = {
     val key = rRef.ctx.asInstanceOf[SelectionKey]
-
-    if (key.isValid) {
-      key.cancel()
-    }
     val client: SocketChannel = key.channel().asInstanceOf[SocketChannel]
     closeConnection(client)
   }

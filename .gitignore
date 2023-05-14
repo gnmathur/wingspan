@@ -1,0 +1,7 @@
+out
+project/project
+project/target
+.idea
+.bsp
+target/
+logs/
