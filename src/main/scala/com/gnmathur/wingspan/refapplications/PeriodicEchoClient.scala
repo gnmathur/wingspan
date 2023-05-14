@@ -162,10 +162,7 @@ class PeriodicEchoClient(coreReactor: Reactor) extends TcpClient with ClientHand
     coreReactor.clearWrite(reactorConnectionContext)
   }
 
-  private def runClient(periodInMs: Int, host: String, port: Int, msg: String) {
-    val randomJitter = scala.util.Random.nextInt(1000)
-    val addOrSub = if (scala.util.Random.nextInt(100) < 50) -1 else 1
-
+  private def runClient(periodInMs: Int, host: String, port: Int, msg: String): Unit = {
     coreReactor.registerRequest(host, port, periodInMs, ConnectionContext(host, port, msg))
   }
 
