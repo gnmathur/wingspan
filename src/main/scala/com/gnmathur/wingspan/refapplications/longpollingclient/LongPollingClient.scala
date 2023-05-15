@@ -1,6 +1,7 @@
-package com.gnmathur.wingspan.refapplications
+package com.gnmathur.wingspan.refapplications.longpollingclient
 
-import com.gnmathur.wingspan.core.{ClientHandlers, Reactor, EVENT_CB_STATUS_T, READ_ERROR, READ_OK, ReactorConnectionCtx, Statistics, TcpClient, TimerCb, WRITE_OK}
+import com.gnmathur.wingspan.core._
+import com.gnmathur.wingspan.refapplications.EchoFrame
 import org.slf4j.LoggerFactory
 
 import java.io.IOException
@@ -12,7 +13,7 @@ import java.nio.channels.SocketChannel
  * 1. Does this need to be a class at all? These are all static objects
  */
 
-object PeriodicEchoClient extends App {
+object LongPollingClient extends App {
   private abstract class READ_STATE
   private case object READ_NEW extends READ_STATE
   private case object READ_LEN extends READ_STATE
@@ -28,17 +29,21 @@ object PeriodicEchoClient extends App {
   }
 
   private val coreReactor: Reactor = new Reactor()
-  new PeriodicEchoClient(coreReactor)
+  new LongPollingClient(coreReactor)
   coreReactor.run()
 }
 
-class PeriodicEchoClient(coreReactor: Reactor) extends TcpClient with ClientHandlers {
-  import PeriodicEchoClient._
+class LongPollingClient(coreReactor: Reactor) extends TcpClient with ClientHandlers {
+  import LongPollingClient._
 
-  protected val logger = LoggerFactory.getLogger(classOf[PeriodicEchoClient])
+  protected val logger = LoggerFactory.getLogger(classOf[LongPollingClient])
+
+  override def disconnectCb(client: SocketChannel, clientMetadata: AnyRef): Unit = {
+    logger.info(s"disconnected from ${coreReactor.getConnectionLocalEndpoint(client)}")
+  }
 
   override def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit = {
-    logger.info(s"connected to ${coreReactor.getConnectionRemoteHostAddress(sc)}")
+    logger.info(s"connected to ${coreReactor.getConnectionLocalEndpoint(sc)}")
     coreReactor.setWriteReady(connectionContext)
   }
 
@@ -167,8 +172,5 @@ class PeriodicEchoClient(coreReactor: Reactor) extends TcpClient with ClientHand
   }
 
   coreReactor.registerClient( this)
-  runClient(60000, "sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!")
-  runClient(10000, "sys76-1", 6771, "West is west of east. East is east of west. Fact")
-  runClient(5000, "sys76-1", 6772, "Washington DC is the capital of the US. =======")
-  runClient(15000, "sys76-1", 6773, "Two roads diverged in a wood, and I – I took the road less traveled by")
+  runClient(0, "sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!")
 }
