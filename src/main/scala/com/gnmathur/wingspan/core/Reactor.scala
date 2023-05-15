@@ -30,7 +30,7 @@ import io.prometheus.client.exporter.HTTPServer.Builder
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.io.IOException
-import java.net.InetSocketAddress
+import java.net.{InetAddress, InetSocketAddress}
 import java.nio.channels.SelectionKey.{OP_READ, OP_WRITE}
 import java.nio.channels.{SelectionKey, Selector, SocketChannel}
 import java.util
@@ -38,7 +38,7 @@ import java.util.{Date, UUID}
 import java.util.concurrent.{Semaphore, TimeUnit}
 import java.util.concurrent.atomic.AtomicBoolean
 import scala.collection.mutable
-import scala.util.Try
+import scala.util.{Try, Success, Failure}
 
 private case class ClientConnectionStats() {
   var connectAttempts = 0L
@@ -52,10 +52,25 @@ private case class ClientConnectionStats() {
   var lastRespRcvdAt: Option[Long] = None
 }
 
+sealed abstract class Period
+case class Periodic(periodInMs: Long) extends Period
+case object LongPoll extends Period
+
+sealed abstract class ConnectionState
+case object Connecting extends ConnectionState
+case object Connected extends ConnectionState
+case object Disconnected extends ConnectionState
+
 // Container for client's connection-specific context, including the client's metadata, which is opaque to the
 // reactor
-private case class ReactorClientConnCtx(clientMetadata: AnyRef, host: String, port: Int, periodInMs: Long) {
+private case class ReactorClientConnCtx(
+                                         clientMetadata: AnyRef,
+                                         host: String,
+                                         port: Int,
+                                         periodInMs: Long
+                                       ) {
   val stats = ClientConnectionStats()
+  var state: ConnectionState = Disconnected
 }
 
 // Connection context understood by the reactor but opaque to the client. The client is supposed to return this back
@@ -82,6 +97,8 @@ trait ClientHandlers {
    * can use this when this callback is invoked to take stateful action
    */
   def connectFailCb(sc: SocketChannel, clientMetadata: AnyRef): Unit
+
+  def disconnectCb(sc: SocketChannel, clientMetadata: AnyRef): Unit
 
   /**
    * Read callback for when there's something to be read from the a connection channel
@@ -131,13 +148,14 @@ object TimerIdGiver {
   }
 }
 
-class TimerCb(val timeout: Long,  // in milliseconds
+class TimerCb(timeout: Long,  // in milliseconds
               timerCb: => Unit // callback to invoke when the timer expires
              ) {
   val createdAt: Long = System.currentTimeMillis()
   val expiresAt: Long = createdAt + timeout
   def isExpired: Boolean = expiresAt < System.currentTimeMillis()
   def call(): Unit = timerCb
+  def getTimeout: Long = timeout
   val id: Int = TimerIdGiver.give
 
 
@@ -146,8 +164,9 @@ class TimerCb(val timeout: Long,  // in milliseconds
 
 class Reactor {
   private val selector: Selector = Selector.open()
-  private def orderTimers(timerCb: TimerCb) = timerCb.expiresAt
-  private val timers = new mutable.PriorityQueue[TimerCb]()(Ordering.by(orderTimers).reverse)
+  private def orderTimersByExpirationTime(timerCb: TimerCb) = timerCb.expiresAt
+  private def orderTimersByPeriod(timerCb: TimerCb) = timerCb.getTimeout
+  private val timers = new mutable.PriorityQueue[TimerCb]()(Ordering.by(orderTimersByExpirationTime).reverse)
   private val logger = LoggerFactory.getLogger(classOf[Reactor])
   private var clientHandlers: Option[ClientHandlers] = None
   private val clientConnectionList = mutable.LinkedHashMap[(String, Int), ReactorClientConnCtx]()
@@ -184,6 +203,10 @@ class Reactor {
     selector.close()
   }
 
+  /**
+   * Cancel the key associated with the channel and close it
+   * @param cc Socket channel to close
+   */
   private def closeConnection(cc: SocketChannel): Unit = {
     val selectionKey = cc.keyFor(selector)
     if (selectionKey.isValid)
@@ -193,30 +216,20 @@ class Reactor {
     cc.close()
   }
 
-  def getConnectionRemoteHostName(cc: SocketChannel): Try[String] =
-      Try(cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getHostName)
-
-  def getConnectionRemoteHostAddress(cc: SocketChannel): Try[String] =
-      Try(cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getAddress.getHostAddress)
-
-  def getConnectionRemotePort(cc: SocketChannel): Try[Int] =
-    Try(cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getPort)
-
-  def registerTimer(timerCb: TimerCb): Unit = {
-    timers.enqueue(timerCb)
-  }
-
-  def registerClient(ch: ClientHandlers): Unit = {
-    clientHandlers = Some(ch)
-  }
-
   private def connect(reactorClientConnCtx: ReactorClientConnCtx): Unit = {
+    if (reactorClientConnCtx.state != Disconnected) {
+      logger.warn(s"Client ${reactorClientConnCtx.host}:${reactorClientConnCtx.port} not disconnected. Rescheduling for later")
+      scheduleConnect(reactorClientConnCtx)
+      return
+    }
+
     val client: SocketChannel = SocketChannel.open();
     client.configureBlocking(false)
     val selectionKey: SelectionKey = client.register(selector, SelectionKey.OP_CONNECT);
 
     selectionKey.attach(reactorClientConnCtx)
     client.connect(new InetSocketAddress(reactorClientConnCtx.host, reactorClientConnCtx.port))
+    reactorClientConnCtx.state = Connecting
     reactorClientConnCtx.stats.connectAttempts = reactorClientConnCtx.stats.connectAttempts + 1
 
     scheduleConnect(reactorClientConnCtx)
@@ -287,8 +300,10 @@ class Reactor {
     // Connected to server
     val client: SocketChannel = key.channel().asInstanceOf[SocketChannel]
     val reactorClientConnCtx = key.attachment().asInstanceOf[ReactorClientConnCtx]
+
     try {
       val isConnected = client.finishConnect()
+      reactorClientConnCtx.state = Connected
       logger.debug("Connected: " + client.getRemoteAddress)
       reactorClientConnCtx.stats.connectSuccess = reactorClientConnCtx.stats.connectSuccess + 1
       key.interestOps(key.interestOps & (~SelectionKey.OP_CONNECT))
@@ -300,6 +315,59 @@ class Reactor {
         done(ReactorConnectionCtx(key))
       case _: Throwable => logger.error("Non I/O exception")
     }
+  }
+
+  private def statsPrinter(): Unit = {
+    def printConnectionStats(host: String, port: Int, c: ClientConnectionStats): Unit = {
+      val lastRequestSentAt = if (c.lastReqSentAt.isEmpty) s"<None>" else (new Date(c.lastReqSentAt.get)).toString
+      val lastResponseRcvdAt = if (c.lastRespRcvdAt.isEmpty) s"<None>" else (new Date(c.lastRespRcvdAt.get)).toString
+
+      val line =
+        s"[host: ${host}, port: ${port}] TimerQ: ${timers.size} " +
+          s"connAttempts: ${c.connectAttempts}, connFails: ${c.connectFails} connSucc: ${c.connectSuccess} " +
+          s"read: ${c.reads} read: ${c.readFails} writes: ${c.writes} writeFails: ${c.writeFails} " +
+          s"lastReqAt: ${lastResponseRcvdAt} lastRespAt: ${lastResponseRcvdAt}"
+
+      logger.info(line)
+    }
+
+    clientConnectionList.foreach { case ((h, p), rCCCtx) => printConnectionStats(h, p, rCCCtx.stats) }
+    registerTimer(new TimerCb(30000, statsPrinter))
+  }
+
+  def getConnectionRemoteHostName(cc: SocketChannel): String =
+    Try {
+      cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getHostName
+    } match {
+      case Success(hostName) => hostName
+      case Failure(exception) => "Unknown"
+    }
+
+  def getConnectionRemoteHostAddress(cc: SocketChannel): String =
+    Try {
+      cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getAddress.getHostAddress
+    } match {
+      case Success(hostAddress) => hostAddress
+      case Failure(exception) => "Unknown"
+    }
+
+  def getConnectionLocalEndpoint(cc: SocketChannel): String =
+    Try {
+      s"${cc.getLocalAddress.asInstanceOf[InetSocketAddress].getAddress}:${cc.getLocalAddress.asInstanceOf[InetSocketAddress].getPort}"
+    } match {
+      case Success(localEndpoint) => localEndpoint
+      case Failure(exception) => "Unknown"
+    }
+
+  def getConnectionRemotePort(cc: SocketChannel): Try[Int] =
+    Try(cc.getRemoteAddress.asInstanceOf[InetSocketAddress].getPort)
+
+  def registerTimer(timerCb: TimerCb): Unit = {
+    timers.enqueue(timerCb)
+  }
+
+  def registerClient(ch: ClientHandlers): Unit = {
+    clientHandlers = Some(ch)
   }
 
   /**
@@ -353,41 +421,30 @@ class Reactor {
     key.interestOps(key.interestOps() & ~(SelectionKey.OP_WRITE))
   }
 
-  def done(rRef: ReactorConnectionCtx) = {
+  def done(rRef: ReactorConnectionCtx): Unit = {
     val key = rRef.ctx.asInstanceOf[SelectionKey]
     val client: SocketChannel = key.channel().asInstanceOf[SocketChannel]
+    val reactorClientConnCtx = key.attachment().asInstanceOf[ReactorClientConnCtx]
+
+    clientHandlers.get.disconnectCb(client, reactorClientConnCtx)
     closeConnection(client)
+    reactorClientConnCtx.state = Disconnected
   }
 
-  private def statsPrinter(): Unit = {
-    def printConnectionStats(host: String, port: Int, c: ClientConnectionStats): Unit = {
-      val lastRequestSentAt = if (c.lastReqSentAt.isEmpty) s"<None>" else (new Date(c.lastReqSentAt.get)).toString
-      val lastResponseRcvdAt = if (c.lastRespRcvdAt.isEmpty) s"<None>" else (new Date(c.lastRespRcvdAt.get)).toString
+  private def selectTimeout = 100
 
-      val line =
-      s"[host: ${host}, port: ${port}]  " +
-      s"connAttempts: ${c.connectAttempts}, connFails: ${c.connectFails} connSucc: ${c.connectSuccess} " +
-      s"read: ${c.reads} read: ${c.readFails} writes: ${c.writes} writeFails: ${c.writeFails} " +
-      s"lastReqAt: ${lastResponseRcvdAt} lastRespAt: ${lastResponseRcvdAt}"
-
-      logger.info(line)
-    }
-
-    clientConnectionList.foreach { case ((h, p), rCCCtx) => printConnectionStats(h, p, rCCCtx.stats) }
-    registerTimer(new TimerCb(30000, statsPrinter))
-  }
-
-  private def selectTimeout = 500
-
+  /**
+   * Run the reactor.
+   */
   def run(): Unit = {
-    statsPrinter
+    statsPrinter()
 
     while (keepRunning.get()) {
       val readyN = selector.select(selectTimeout)
 
       while (timers.nonEmpty && (timers.head.isExpired)) {
         val timerCb = timers.dequeue()
-        timerCb.call
+        timerCb.call()
       }
 
       val selectedKeys: util.Set[SelectionKey] = selector.selectedKeys()
