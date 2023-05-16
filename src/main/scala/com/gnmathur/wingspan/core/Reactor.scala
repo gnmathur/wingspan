@@ -180,7 +180,7 @@ class Reactor {
   private val haltSignal = new Semaphore(0)
   private val registry = new CollectorRegistry()
   private val httpServer = new HTTPServer.Builder().withPort(8080).withPort(8081).build()
-  private val SHUTDOWN_TIMER_EXPIRY_MS = 60000
+  private val SHUTDOWN_TIMER_EXPIRY_MS = 15000
   private val thisThread = Thread.currentThread()
 
   Runtime.getRuntime.addShutdownHook(new Thread() {
@@ -218,7 +218,7 @@ class Reactor {
     if (selectionKey.isValid)
       selectionKey.cancel()
     else
-      logger.warn("Selection key is not valid. Ignoring")
+      logger.debug("Selection key is not valid. Ignoring")
     cc.close()
   }
 
@@ -464,6 +464,8 @@ class Reactor {
    * Run the reactor.
    */
   def run(): Unit = {
+    logger.info("Starting reactor")
+
     statsPrinter()
 
     while (keepRunning.get()) {

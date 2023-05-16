@@ -8,34 +8,33 @@ import java.io.IOException
 import java.nio.ByteBuffer
 import java.nio.channels.SocketChannel
 
-/**
- * TODOs
- * 1. Does this need to be a class at all? These are all static objects
+private abstract class READ_STATE
+private case object READ_NEW extends READ_STATE
+private case object READ_LEN extends READ_STATE
+
+/** Tracks application state. Handed to the reactor at creation, and is handed to this application in callbacks to
+ * let the application retrieve its state.
  */
+private sealed case class ConnectionContext(host: String, port: Int, msg: String) {
+  var readState: READ_STATE = READ_NEW
+  var readBuffer: ByteBuffer = ByteBuffer.allocate(4)
+  var writeBuffer: ByteBuffer = ByteBuffer.allocate(1024)
+  var readBytes: Option[Array[Byte]] = None
+}
 
 object PeriodicEchoClient extends App {
-  private abstract class READ_STATE
-  private case object READ_NEW extends READ_STATE
-  private case object READ_LEN extends READ_STATE
-
-  /** Tracks application state. Handed to the reactor at creation, and is handed to this application in callbacks to
-   * let the application retrieve its state.
-   */
-  private sealed case class ConnectionContext(host: String, port: Int, msg: String) {
-    var readState: READ_STATE = READ_NEW
-    var readBuffer: ByteBuffer = ByteBuffer.allocate(4)
-    var writeBuffer: ByteBuffer = ByteBuffer.allocate(1024)
-    var readBytes: Option[Array[Byte]] = None
-  }
 
   private val coreReactor: Reactor = new Reactor()
-  new PeriodicEchoClient(coreReactor)
+  val pec = new PeriodicEchoClient(coreReactor)
+  coreReactor.registerClient(pec)
+  pec.runClient(Periodic(60000), "sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!")
+  pec.runClient(Periodic(10000), "sys76-1", 6771, "West is west of east. East is east of west. Fact")
+  pec.runClient(Periodic(5000), "sys76-1", 6772, "Washington DC is the capital of the US.")
+  pec.runClient(Periodic(15000), "sys76-1", 6773, "Two roads diverged in a wood, and I – I took the road less traveled by")
   coreReactor.run()
 }
 
 class PeriodicEchoClient(coreReactor: Reactor) extends TcpClient with ClientHandlers {
-  import PeriodicEchoClient._
-
   protected val logger = LoggerFactory.getLogger(classOf[PeriodicEchoClient])
 
   override def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit = {
@@ -163,15 +162,9 @@ class PeriodicEchoClient(coreReactor: Reactor) extends TcpClient with ClientHand
     coreReactor.clearWrite(reactorConnectionContext)
   }
 
-  private def runClient(period: Period, host: String, port: Int, msg: String): Unit = {
+  def runClient(period: Period, host: String, port: Int, msg: String): Unit = {
     coreReactor.registerRequest(host, port, period, ConnectionContext(host, port, msg))
   }
-
-  coreReactor.registerClient( this)
-  runClient(Periodic(60000), "sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!")
-  runClient(Periodic(10000), "sys76-1", 6771, "West is west of east. East is east of west. Fact")
-  runClient(Periodic(5000), "sys76-1", 6772, "Washington DC is the capital of the US.")
-  runClient(Periodic(15000), "sys76-1", 6773, "Two roads diverged in a wood, and I – I took the road less traveled by")
 
   override def disconnectCb(client: SocketChannel, clientMetadata: AnyRef): Unit = {}
 }
