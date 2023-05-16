@@ -163,15 +163,15 @@ class PeriodicEchoClient(coreReactor: Reactor) extends TcpClient with ClientHand
     coreReactor.clearWrite(reactorConnectionContext)
   }
 
-  private def runClient(periodInMs: Int, host: String, port: Int, msg: String): Unit = {
-    coreReactor.registerRequest(host, port, periodInMs, ConnectionContext(host, port, msg))
+  private def runClient(period: Period, host: String, port: Int, msg: String): Unit = {
+    coreReactor.registerRequest(host, port, period, ConnectionContext(host, port, msg))
   }
 
   coreReactor.registerClient( this)
-  runClient(60000, "sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!")
-  runClient(10000, "sys76-1", 6771, "West is west of east. East is east of west. Fact")
-  runClient(5000, "sys76-1", 6772, "Washington DC is the capital of the US.")
-  runClient(15000, "sys76-1", 6773, "Two roads diverged in a wood, and I – I took the road less traveled by")
+  runClient(Periodic(60000), "sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!")
+  runClient(Periodic(10000), "sys76-1", 6771, "West is west of east. East is east of west. Fact")
+  runClient(Periodic(5000), "sys76-1", 6772, "Washington DC is the capital of the US.")
+  runClient(Periodic(15000), "sys76-1", 6773, "Two roads diverged in a wood, and I – I took the road less traveled by")
 
   override def disconnectCb(client: SocketChannel, clientMetadata: AnyRef): Unit = {}
 }
