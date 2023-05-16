@@ -38,12 +38,9 @@ class LongPollingClient(coreReactor: Reactor) extends TcpClient with ClientHandl
 
   protected val logger = LoggerFactory.getLogger(classOf[LongPollingClient])
 
-  override def disconnectCb(client: SocketChannel, clientMetadata: AnyRef): Unit = {
-    logger.info(s"disconnected from ${coreReactor.getConnectionLocalEndpoint(client)}")
-  }
+  override def disconnectCb(client: SocketChannel, clientMetadata: AnyRef): Unit = {}
 
   override def connectDoneCb(sc: SocketChannel, connectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit = {
-    logger.info(s"connected to ${coreReactor.getConnectionLocalEndpoint(sc)}")
     coreReactor.setWriteReady(connectionContext)
   }
 
@@ -123,7 +120,6 @@ class LongPollingClient(coreReactor: Reactor) extends TcpClient with ClientHandl
 
   private def reconnect(myContext: ConnectionContext)(): Unit = {
     logger.info("reconnecting " + myContext.host + " " + myContext.port)
-    //coreReactor.registerRequest(myContext.host, myContext.port, myContext)
   }
 
   override def readFailCb(cc: SocketChannel, reactorConnectionContext: ReactorConnectionCtx, clientMetadata: AnyRef): Unit = {
@@ -167,10 +163,11 @@ class LongPollingClient(coreReactor: Reactor) extends TcpClient with ClientHandl
     coreReactor.clearWrite(reactorConnectionContext)
   }
 
-  private def runClient(periodInMs: Int, host: String, port: Int, msg: String): Unit = {
-    coreReactor.registerRequest(host, port, periodInMs, ConnectionContext(host, port, msg))
+  private def runClient(period: Period, host: String, port: Int, msg: String): Unit = {
+    coreReactor.registerRequest(host, port, period: Period, ConnectionContext(host, port, msg))
   }
 
   coreReactor.registerClient( this)
-  runClient(0, "sys76-1", 6770, "Taj Mahal is a wonder of the world. Go see it!!!")
+  runClient(LongPoll, "sys76-1", 6770, "Tis better to have loved and lost than never to have loved at all")
+  runClient(LongPoll, "sys76-1", 6771, "I think therefore I am")
 }

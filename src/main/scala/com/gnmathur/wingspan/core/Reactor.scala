@@ -67,7 +67,7 @@ private case class ReactorClientConnCtx(
                                          clientMetadata: AnyRef,
                                          host: String,
                                          port: Int,
-                                         periodInMs: Long
+                                         period: Period
                                        ) {
   val stats = ClientConnectionStats()
   var state: ConnectionState = Disconnected
@@ -162,10 +162,16 @@ class TimerCb(timeout: Long,  // in milliseconds
   override def toString = s"TimerCb($createdAt, $expiresAt, $id, $timeout, $isExpired)"
 }
 
+/**
+ * Reactor is a non-blocking, single-threaded, event-driven, asynchronous I/O library.
+ * It's a wrapper around Java's NIO library. It's designed to be used by clients that
+ * need to maintain a large number of connections to a large number of servers.
+ */
 class Reactor {
   private val selector: Selector = Selector.open()
   private def orderTimersByExpirationTime(timerCb: TimerCb) = timerCb.expiresAt
   private def orderTimersByPeriod(timerCb: TimerCb) = timerCb.getTimeout
+  private val timerDb = mutable.LinkedHashMap[Int, TimerCb]()
   private val timers = new mutable.PriorityQueue[TimerCb]()(Ordering.by(orderTimersByExpirationTime).reverse)
   private val logger = LoggerFactory.getLogger(classOf[Reactor])
   private var clientHandlers: Option[ClientHandlers] = None
@@ -232,14 +238,30 @@ class Reactor {
     reactorClientConnCtx.state = Connecting
     reactorClientConnCtx.stats.connectAttempts = reactorClientConnCtx.stats.connectAttempts + 1
 
-    scheduleConnect(reactorClientConnCtx)
+    reactorClientConnCtx.period match {
+      case Periodic(_) => scheduleConnect(reactorClientConnCtx)
+      case LongPoll => // do nothing; Long poll is scheduled with a 0 timeout in the done handler
+    }
   }
 
+  /**
+   * Schedule a connect on -
+   * a. the registration of a new client connection
+   * b. when a client connection is being triggered (next fetch)
+   * c. when a client connection is being re-triggered (long poll; scheduled with a 0 timeout)
+   *
+   * @param reactorClientConnCtx Reactor maintained client connection context
+   */
   private def scheduleConnect(reactorClientConnCtx: ReactorClientConnCtx): Unit = {
     val randomJitter = scala.util.Random.nextInt(1000)
     val addOrSub = if (scala.util.Random.nextInt(100) < 50) -1 else 1
 
-    registerTimer(new TimerCb(reactorClientConnCtx.periodInMs + (addOrSub * randomJitter), connect(reactorClientConnCtx)))
+    reactorClientConnCtx.period match {
+      case Periodic(period) =>
+        registerTimer(new TimerCb(period + (addOrSub * randomJitter), connect(reactorClientConnCtx)))
+      case LongPoll =>
+        registerTimer(new TimerCb(0, connect(reactorClientConnCtx)))
+    }
   }
 
   /**
@@ -249,8 +271,8 @@ class Reactor {
    * @param port Connection endpoint host port
    * @param connectionCtx Opaque connection context to be returned back to client handlers callbacks
    */
-  def registerRequest(host: String, port: Int, periodInMs: Long, connectionCtx: AnyRef): Unit = {
-    val reactorClientConnCtx = ReactorClientConnCtx(connectionCtx, host, port, periodInMs)
+  def registerRequest(host: String, port: Int, period: Period, connectionCtx: AnyRef): Unit = {
+    val reactorClientConnCtx = ReactorClientConnCtx(connectionCtx, host, port, period)
     clientConnectionList += (host, port) -> reactorClientConnCtx
 
     scheduleConnect(reactorClientConnCtx)
@@ -429,6 +451,11 @@ class Reactor {
     clientHandlers.get.disconnectCb(client, reactorClientConnCtx)
     closeConnection(client)
     reactorClientConnCtx.state = Disconnected
+
+    reactorClientConnCtx.period match {
+      case Periodic(_) => // do nothing
+      case LongPoll => scheduleConnect(reactorClientConnCtx)
+    }
   }
 
   private def selectTimeout = 100
@@ -440,11 +467,18 @@ class Reactor {
     statsPrinter()
 
     while (keepRunning.get()) {
-      val readyN = selector.select(selectTimeout)
-
+      var firedATimer = false
       while (timers.nonEmpty && (timers.head.isExpired)) {
         val timerCb = timers.dequeue()
         timerCb.call()
+        firedATimer = true
+      }
+
+      var readyN = 0
+      if (firedATimer) {
+        readyN = selector.selectNow()
+      } else {
+        readyN = selector.select(selectTimeout)
       }
 
       val selectedKeys: util.Set[SelectionKey] = selector.selectedKeys()
